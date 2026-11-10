@@ -46,7 +46,7 @@ class SafeIntegrationTests(unittest.TestCase):
             FakeResponse({"coins": [{"slug": "sol", "name": "Solana"}]}),
             FakeResponse({"limit_min": 10, "limit_max": 50, "limit_step": 5, "default": 50}),
         ]
-        result = BTChackClient(session=session).status()
+        result = BTChackClient(base_url="https://btchack.test", session=session).status()
         called_paths = [call.args[0].split("btchack.test")[-1] for call in session.get.call_args_list]
         self.assertEqual(
             called_paths,
