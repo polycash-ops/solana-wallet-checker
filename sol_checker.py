@@ -1,69 +1,154 @@
+#!/usr/bin/env python3
+"""Finite, read-only Solana balance checker for public addresses you own.
 
-import time
-import requests
+This tool never generates keypairs, accepts private keys, or writes secrets.
+BTChack integration is deliberately limited to health/readiness and public
+coin/limit metadata. It does not call keyspace, page, find, derive, or key
+inspection endpoints.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+from typing import Iterable
+
 import base58
-import nacl.signing
-from colorama import Fore, Style, init
+import requests
 
-# Initialize colorama for Windows support
-init(autoreset=True)
+SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+BTCHACK_BASE_URL = os.getenv("BTCHACK_BASE_URL", "https://btchack.net").rstrip("/")
+HTTP_TIMEOUT = 12
 
-# Solana JSON RPC endpoint (Mainnet)
-RPC_URL = "https://api.mainnet-beta.solana.com"
 
-# Output file for saving wallets with balance > 0
-WALLET_FILE = "solana_wallets.txt"
+def load_addresses(path: Path) -> list[str]:
+    addresses: list[str] = []
+    for line_number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        value = raw.strip()
+        if not value or value.startswith("#"):
+            continue
+        try:
+            decoded = base58.b58decode(value)
+        except Exception as exc:
+            raise ValueError(f"Invalid Base58 public address on line {line_number}") from exc
+        if len(decoded) != 32:
+            raise ValueError(f"Expected a 32-byte Solana public address on line {line_number}")
+        addresses.append(value)
+    # Preserve order while avoiding duplicate RPC requests.
+    return list(dict.fromkeys(addresses))
 
-def generate_solana_address():
-    signing_key = nacl.signing.SigningKey.generate()
-    verify_key = signing_key.verify_key
-    # Encode the public key to get the Solana address
-    sol_address = base58.b58encode(verify_key.encode()).decode()
 
-    # Encode the private key in Base58
-    solana_private_key = signing_key.encode() + verify_key.encode()
-    private_key_base58 = base58.b58encode(solana_private_key).decode()
+class BTChackClient:
+    """Metadata-only BTChack client; never requests key-bearing endpoints."""
 
-    return sol_address, private_key_base58
+    def __init__(self, base_url: str = BTCHACK_BASE_URL, session=None):
+        self.base_url = base_url.rstrip("/")
+        self.session = session or requests.Session()
 
-# Function to check balance
-def get_solana_balance(address):
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getBalance",
-        "params": [address]
-    }
-    response = requests.post(RPC_URL, json=payload)
-    if response.status_code == 200:
-        data = response.json()
-        return data.get("result", {}).get("value", 0)  # Balance in lamports
-    else:
-        print(Fore.RED + "Error fetching balance:", response.text)
-        return None
+    def _get(self, path: str) -> dict:
+        response = self.session.get(f"{self.base_url}{path}", timeout=HTTP_TIMEOUT)
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError(f"Unexpected BTChack response for {path}")
+        return payload
 
-# Function to save wallet to file
-def save_wallet(address, private_key, balance):
-    with open(WALLET_FILE, "a") as file:
-        file.write(f"Address: {address}\nPrivate Key: {private_key}\nBalance: {balance} lamports\n{'-'*40}\n")
-    print(Fore.MAGENTA + f"Wallet saved to {WALLET_FILE}")
+    def status(self) -> dict:
+        result = {}
+        for label, path in (("health", "/healthz"), ("readiness", "/readyz")):
+            try:
+                data = self._get(path)
+                # Whitelist harmless status fields; do not dump arbitrary API data.
+                result[label] = {
+                    key: data[key]
+                    for key in ("status", "ok", "ready", "service")
+                    if key in data and isinstance(data[key], (str, bool, int, float))
+                }
+                result[label]["reachable"] = True
+            except (requests.RequestException, ValueError):
+                result[label] = {"reachable": False}
+        try:
+            coins = self._get("/api/v1/coins").get("coins", [])
+            result["solana_supported"] = any(
+                isinstance(coin, dict) and str(coin.get("slug", "")).lower() == "sol"
+                for coin in coins
+            )
+        except (requests.RequestException, ValueError):
+            result["solana_supported"] = None
+        try:
+            limits = self._get("/api/v1/limits")
+            result["limits"] = {
+                key: limits[key]
+                for key in ("limit_min", "limit_max", "limit_step", "default")
+                if key in limits and isinstance(limits[key], int)
+            }
+        except (requests.RequestException, ValueError):
+            result["limits"] = None
+        return result
 
-# Infinite loop to generate new addresses and check balances
-while True:
-    sol_address, private_key_base58 = generate_solana_address()
 
-    print(Fore.CYAN + f"\nSolana Address: {sol_address}")
-    print(Fore.YELLOW + f"Private Key: {private_key_base58}")
+def get_balance(address: str, session=None) -> int:
+    client = session or requests
+    response = client.post(
+        SOLANA_RPC_URL,
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getBalance",
+            "params": [address, {"commitment": "confirmed"}],
+        },
+        timeout=HTTP_TIMEOUT,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("error"):
+        raise RuntimeError("Solana RPC returned an error")
+    value = payload.get("result", {}).get("value")
+    if not isinstance(value, int) or value < 0:
+        raise ValueError("Solana RPC returned an invalid balance")
+    return value
 
-    balance = get_solana_balance(sol_address)
-    if balance is not None:
-        print(Fore.RED + f"Balance: {balance} ({balance / 1_000_000_000} SOL)")
 
-        # Save wallet if balance is greater than 0
-        if balance > 0:
-            save_wallet(sol_address, private_key_base58, balance)
-    else:
-        print(Fore.RED + "Failed to retrieve balance.")
+def main(argv: Iterable[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Check balances for your Solana public addresses.")
+    parser.add_argument("--address-file", default="addresses.txt", help="One public address per line")
+    parser.add_argument("--skip-btchack", action="store_true", help="Skip BTChack metadata status")
+    args = parser.parse_args(argv)
 
-    time.sleep(0.2)
+    address_file = Path(args.address_file)
+    if not address_file.is_file():
+        print(f"Address file not found: {address_file}", file=sys.stderr)
+        return 2
+    try:
+        addresses = load_addresses(address_file)
+    except (OSError, UnicodeError, ValueError) as exc:
+        print(f"Could not read address file: {exc}", file=sys.stderr)
+        return 2
+    if not addresses:
+        print("No public addresses found. Add one address per line to addresses.txt.")
+        return 0
 
+    if not args.skip_btchack:
+        status = BTChackClient().status()
+        print("BTChack metadata status:")
+        print(f"  Health reachable: {status['health']['reachable']}")
+        print(f"  Readiness reachable: {status['readiness']['reachable']}")
+        print(f"  SOL listed as supported: {status['solana_supported']}")
+        print("  Scope: metadata only; no keyspace or private-key endpoints called")
+
+    print(f"Checking {len(addresses)} unique public address(es) via Solana read-only RPC.")
+    failures = 0
+    for address in addresses:
+        try:
+            lamports = get_balance(address)
+            print(f"{address}  {lamports / 1_000_000_000:.9f} SOL  ({lamports} lamports)")
+        except (requests.RequestException, RuntimeError, ValueError) as exc:
+            failures += 1
+            print(f"{address}  ERROR: {type(exc).__name__}")
+    print(f"Complete: {len(addresses) - failures} successful, {failures} failed.")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
